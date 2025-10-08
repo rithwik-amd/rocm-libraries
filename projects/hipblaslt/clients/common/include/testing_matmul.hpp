@@ -55,6 +55,10 @@
 #include <omp.h>
 #include <set>
 
+const int TEST_ITER = 25;
+const int TIME_COLD = 500;
+const int TIME_HOT = 500;
+
 extern "C" __global__ void flush_icache()
 {
     asm __volatile__("s_icache_inv \n\t"
@@ -286,6 +290,33 @@ inline void post_gpu_time(bool         use_gpu_timer,
         gpu_time_used = get_time_us_sync(stream) - gpu_time_used;
     }
 }
+
+void get_time_estimate(std::vector<hipblaslt_ext::Gemm>& gemmVec,
+		       int &i, int32_t block_count, bool gpu_timer, hipStream_t &stream, double &time_appx)
+{
+  hipEvent_t event_gpu_time_start, event_gpu_time_end;
+  CHECK_HIP_ERROR(hipEventCreate(&event_gpu_time_start));
+  CHECK_HIP_ERROR(hipEventCreate(&event_gpu_time_end));
+  double gpu_time_used;
+
+  // Warm up
+  for(;i < TEST_ITER; i++)
+      CHECK_HIPBLASLT_ERROR(gemmVec[i % block_count].run(stream));
+
+  pre_gpu_time(gpu_timer, event_gpu_time_start, gpu_time_used, stream);
+  for(;i < TEST_ITER; i++)
+      CHECK_HIPBLASLT_ERROR(gemmVec[i % block_count].run(stream));
+  post_gpu_time(gpu_timer,
+		event_gpu_time_start,
+		event_gpu_time_end,
+		gpu_time_used,
+		stream);
+  CHECK_HIP_ERROR(hipEventDestroy(event_gpu_time_start));
+  CHECK_HIP_ERROR(hipEventDestroy(event_gpu_time_end));
+
+  time_appx = gpu_time_used / (1000 * TEST_ITER);
+}
+
 
 template <typename Tout>
 Tout cast_from_type(void* in, hipDataType type, size_t index)
@@ -3017,7 +3048,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
         }
     }
-    else
+    else // if arg.algo_method != 1 and 2
     {
         std::vector<hipblasLtMatmulHeuristicResult_t> tmpAlgo;
 
@@ -3111,7 +3142,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                 workspace_size = std::max(workspace_size, heuristicResult[i].workspaceSize);
             CHECK_RETURNED_WORKSPACE_SIZE(workspace_size, max_workspace_size);
         }
-        else
+        else // if do_grouped_gemm True
         {
             if(arg.use_ext_setproblem)
             {
@@ -3623,7 +3654,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
         }
     }
-    else
+    else // if (arg.timing)
     {
         // Get device information
         hipDeviceProp_t deviceProps;
@@ -3698,6 +3729,14 @@ void testing_matmul_with_bias(const Arguments& arg,
                                                   tuningVec[heuristicTuningIndex[sol]],
                                                   *dWorkspace));
                     }
+		    // Get time estimate
+		    int i = 0; 
+		    double time_appx;
+		    get_time_estimate(gemmVec, i, block_count, arg.use_gpu_timer, stream, time_appx);
+		    number_cold_calls = std::max(1, static_cast<int>(TIME_COLD / time_appx));
+		    number_hot_calls = std::max(1, static_cast<int>(TIME_HOT / time_appx));
+		    hipblaslt_cout << "Time estimate: " << time_appx << " Using hot_iter: " << number_hot_calls
+				   << " " << "using cold_iter: " << number_cold_calls << std::endl;
                     if(arg.skip_slow_solution_ratio)
                         pre_gpu_time(
                             arg.use_gpu_timer, event_gpu_time_start, gpu_time_used, stream);
@@ -3730,15 +3769,101 @@ void testing_matmul_with_bias(const Arguments& arg,
                     perf_monitor.start();
                     pre_gpu_time(arg.use_gpu_timer, event_gpu_time_start, gpu_time_used, stream);
 
-                    for(int i = 0; i < number_hot_calls; i++)
+
+                    for(;i < number_hot_calls; i++)
                     {
                         CHECK_HIPBLASLT_ERROR(gemmVec[i % block_count].run(stream));
                         if(arg.flush)
                             hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
                     }
                 }
-                else
+                else // if(!arg.use_ext)
                 {
+
+		  // warmup
+		  for(int i = 0; i < TEST_ITER; i++)
+                    {
+                        auto ptr_matmul = matmul[i % block_count][0];
+                        auto ptr_alpha  = arg.scaleAlpha_vector
+                                              ? (dScaleAlphaVec[0].as<char>())
+                                                   + (i % block_count) * size_scaleAlphaVec[0]
+                                              : alpha_in[0];
+
+                        EXPECT_HIPBLAS_STATUS(
+                            hipblasLtMatmul(
+                                handle,
+                                ptr_matmul,
+                                ptr_alpha,
+                                dA[0].as<char>()
+                                    + (i % block_count) * size_dA[0] * realDataTypeSize(TiA),
+                                matA[0],
+                                dB[0].as<char>()
+                                    + (i % block_count) * size_dB[0] * realDataTypeSize(TiB),
+                                matB[0],
+                                &(h_beta[0]),
+                                dC[0].as<char>()
+                                    + (i % block_count) * size_C[0] * realDataTypeSize(To),
+                                matC[0],
+                                (*dDp)[0].as<char>()
+                                    + (i % block_count) * size_D[0] * realDataTypeSize(To),
+                                matD[0],
+                                &heuristicResult[sol].algo,
+                                *dWorkspace,
+                                workspace_size,
+                                stream),
+                            HIPBLAS_STATUS_SUCCESS);
+                        if(i == 0 && (arg.unit_check || arg.norm_check || arg.allclose_check))
+                            copy_gemm_to_host(stream, gemm_count, hD_1, (*dDp));
+                    }
+		  //get estimate
+		  pre_gpu_time(arg.use_gpu_timer, event_gpu_time_start, gpu_time_used, stream);
+		  for(int i = 0; i < TEST_ITER; i++)
+                    {
+                        auto ptr_matmul = matmul[i % block_count][0];
+                        auto ptr_alpha  = arg.scaleAlpha_vector
+                                              ? (dScaleAlphaVec[0].as<char>())
+                                                   + (i % block_count) * size_scaleAlphaVec[0]
+                                              : alpha_in[0];
+
+                        EXPECT_HIPBLAS_STATUS(
+                            hipblasLtMatmul(
+                                handle,
+                                ptr_matmul,
+                                ptr_alpha,
+                                dA[0].as<char>()
+                                    + (i % block_count) * size_dA[0] * realDataTypeSize(TiA),
+                                matA[0],
+                                dB[0].as<char>()
+                                    + (i % block_count) * size_dB[0] * realDataTypeSize(TiB),
+                                matB[0],
+                                &(h_beta[0]),
+                                dC[0].as<char>()
+                                    + (i % block_count) * size_C[0] * realDataTypeSize(To),
+                                matC[0],
+                                (*dDp)[0].as<char>()
+                                    + (i % block_count) * size_D[0] * realDataTypeSize(To),
+                                matD[0],
+                                &heuristicResult[sol].algo,
+                                *dWorkspace,
+                                workspace_size,
+                                stream),
+                            HIPBLAS_STATUS_SUCCESS);
+                        if(i == 0 && (arg.unit_check || arg.norm_check || arg.allclose_check))
+                            copy_gemm_to_host(stream, gemm_count, hD_1, (*dDp));
+                    }
+		  post_gpu_time(arg.use_gpu_timer,
+				event_gpu_time_start,
+				event_gpu_time_end,
+				gpu_time_used,
+				stream);
+
+		  // Get time estimate
+		  double time_appx = gpu_time_used / (1000 * TEST_ITER);
+		  number_cold_calls = std::max(1, static_cast<int>(TIME_COLD / time_appx));
+		  number_hot_calls = std::max(1, static_cast<int>(TIME_HOT / time_appx));
+		  hipblaslt_cout << "Time estimate us: " << time_appx * 1000 << " Using hot_iter: " << number_hot_calls
+				 << " " << "using cold_iter: " << number_cold_calls << std::endl;
+		  
                     if(arg.skip_slow_solution_ratio)
                         pre_gpu_time(
                             arg.use_gpu_timer, event_gpu_time_start, gpu_time_used, stream);
@@ -3839,8 +3964,10 @@ void testing_matmul_with_bias(const Arguments& arg,
                               gpu_time_used,
                               stream);
                 perf_monitor.stop();
+		double lat = gpu_time_used / number_hot_calls;
+		hipblaslt_cout << "latency : " << lat << std::endl;
             }
-            else
+            else // if(do_grouped_gemm)
             {
                 EfficiencyMonitor& perf_monitor = getEfficiencyMonitor();
                 if(arg.use_user_args)
@@ -3907,7 +4034,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                                   stream);
                     perf_monitor.stop();
                 }
-                else
+                else // if(!arg.use_user_args)
                 {
                     //grouped gemm
                     for(int32_t b = 0; b < block_count; b++)
